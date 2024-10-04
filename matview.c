@@ -201,7 +201,7 @@ static void apply_new_delta(const char *matviewname, const char *deltaname_new,
 				StringInfo target_list);
 static void apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
 				List *keys, StringInfo target_list, StringInfo aggs_set,
-				const char* count_colname);
+				const char* count_colname, bool distinct);
 static char *get_matching_condition_string(List *keys);
 static char *get_returning_string(List *minmax_list, List *is_min_list, List *keys);
 static char *get_minmax_recalc_condition_string(List *minmax_list, List *is_min_list);
@@ -234,6 +234,40 @@ ExecRefreshImmv(const RangeVar *relation, bool skipData,
 				const char *queryString, QueryCompletion *qc)
 {
 	Oid			matviewOid;
+	LOCKMODE	lockmode;
+
+	/* Determine strength of lock needed. */
+	//concurrent = stmt->concurrent;
+	//lockmode = concurrent ? ExclusiveLock : AccessExclusiveLock;
+	lockmode = AccessExclusiveLock;
+
+	/*
+	 * Get a lock until end of transaction.
+	 */
+#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM < 170000)
+	matviewOid = RangeVarGetRelidExtended(relation,
+										  lockmode, 0,
+										  RangeVarCallbackOwnsTable,
+										  NULL);
+#else
+	matviewOid = RangeVarGetRelidExtended(relation,
+										  lockmode, 0,
+										  RangeVarCallbackMaintainsTable,
+										  NULL);
+#endif
+
+	return RefreshImmvByOid(matviewOid, skipData, queryString, qc);
+}
+
+/*
+ * RefreshMatViewByOid -- refresh IMMV view by OID
+ *
+ * This imitates PostgreSQL's RefreshMatViewByOid().
+ */
+ObjectAddress
+RefreshImmvByOid(Oid matviewOid, bool skipData,
+				 const char *queryString, QueryCompletion *qc)
+{
 	Relation	matviewRel;
 	Query	   *dataQuery = NULL; /* initialized to keep compiler happy */
 	Query	   *viewQuery;
@@ -242,8 +276,6 @@ ExecRefreshImmv(const RangeVar *relation, bool skipData,
 	Oid			OIDNewHeap;
 	DestReceiver *dest;
 	uint64		processed = 0;
-	//bool		concurrent;
-	LOCKMODE	lockmode;
 	char		relpersistence;
 	Oid			save_userid;
 	int			save_sec_context;
@@ -259,18 +291,7 @@ ExecRefreshImmv(const RangeVar *relation, bool skipData,
 	bool isnull;
 	Datum datum;
 
-	/* Determine strength of lock needed. */
-	//concurrent = stmt->concurrent;
-	//lockmode = concurrent ? ExclusiveLock : AccessExclusiveLock;
-	lockmode = AccessExclusiveLock;
-
-	/*
-	 * Get a lock until end of transaction.
-	 */
-	matviewOid = RangeVarGetRelidExtended(relation,
-										  lockmode, 0,
-										  RangeVarCallbackOwnsTable, NULL);
-	matviewRel = table_open(matviewOid, lockmode);
+	matviewRel = table_open(matviewOid, NoLock);
 	relowner = matviewRel->rd_rel->relowner;
 
 	/*
@@ -282,8 +303,12 @@ ExecRefreshImmv(const RangeVar *relation, bool skipData,
 	SetUserIdAndSecContext(relowner,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
+#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 170000)
+	RestrictSearchPath();
+#endif
 
 	/*
+	 * Make sure it is an IMMV:
 	 * Get the entry in pg_ivm_immv. If it doesn't exist, the relation
 	 * is not IMMV.
 	 */
@@ -305,6 +330,15 @@ ExecRefreshImmv(const RangeVar *relation, bool skipData,
 	datum = heap_getattr(tup, Anum_pg_ivm_immv_ispopulated, tupdesc, &isnull);
 	Assert(!isnull);
 	oldPopulated = DatumGetBool(datum);
+
+	/*
+	 * Check for active uses of the relation in the current transaction, such
+	 * as open scans.
+	 *
+	 * NB: We count on this to protect us against problems with refreshing the
+	 * data using TABLE_INSERT_FROZEN.
+	 */
+	CheckTableNotInUse(matviewRel, "refresh an IMMV");
 
 	/* Tentatively mark the IMMV as populated or not (this will roll back
 	 * if we fail later).
@@ -342,15 +376,6 @@ ExecRefreshImmv(const RangeVar *relation, bool skipData,
 	/* For IMMV, we need to rewrite matview query */
 	if (!skipData)
 		dataQuery = rewriteQueryForIMMV(viewQuery,NIL);
-
-	/*
-	 * Check for active uses of the relation in the current transaction, such
-	 * as open scans.
-	 *
-	 * NB: We count on this to protect us against problems with refreshing the
-	 * data using TABLE_INSERT_FROZEN.
-	 */
-	CheckTableNotInUse(matviewRel, "refresh an IMMV");
 
 	tableSpace = matviewRel->rd_rel->reltablespace;
 	relpersistence = matviewRel->rd_rel->relpersistence;
@@ -452,8 +477,13 @@ ExecRefreshImmv(const RangeVar *relation, bool skipData,
 	if (!skipData)
 		pgstat_count_heap_insert(matviewRel, processed);
 
+	/*
+	 * Create triggers on incremental maintainable materialized view
+	 * This argument should use 'dataQuery'. This needs to use a rewritten query,
+	 * because a sublink in jointree is not supported by this function.
+	 */
 	if (!skipData && !oldPopulated)
-		CreateIvmTriggersOnBaseTables(viewQuery, matviewOid);
+		CreateIvmTriggersOnBaseTables(dataQuery, matviewOid);
 
 	table_close(matviewRel, NoLock);
 
@@ -534,7 +564,7 @@ refresh_immv_datafill(DestReceiver *dest, Query *query,
 	ExecutorStart(queryDesc, 0);
 
 	/* run the plan */
-	ExecutorRun(queryDesc, ForwardScanDirection, 0L, true);
+	ExecutorRun(queryDesc, ForwardScanDirection, 0, true);
 
 	processed = queryDesc->estate->es_processed;
 
@@ -889,6 +919,9 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	SetUserIdAndSecContext(relowner,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
+#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 170000)
+	RestrictSearchPath();
+#endif
 
 	/* get view query*/
 	query = get_immv_query(matviewRel);
@@ -1612,7 +1645,8 @@ rewrite_exists_subquery_walker(Query *query, Node *node, int *count)
 				if (fromexpr->quals != NULL)
 				{
 					query = rewrite_exists_subquery_walker(query, fromexpr->quals, count);
-					/* drop subquery in WHERE clause */
+
+					/* drop WHERE clause when it has only one EXISTS */
 					if (IsA(fromexpr->quals, SubLink))
 						fromexpr->quals = NULL;
 				}
@@ -1620,35 +1654,25 @@ rewrite_exists_subquery_walker(Query *query, Node *node, int *count)
 			}
 		case T_BoolExpr:
 			{
-				BoolExprType type;
+				BoolExprType type = ((BoolExpr *) node)->boolop;
 
-				type = ((BoolExpr *) node)->boolop;
-				switch (type)
+				if (type == AND_EXPR)
 				{
 					ListCell *lc;
-					case AND_EXPR:
-						foreach(lc, ((BoolExpr *)node)->args)
-						{
-							/* If simple EXISTS subquery is used, rewrite LATERAL subquery */
-							Node *opnode = (Node *)lfirst(lc);
-							query = rewrite_exists_subquery_walker(query, opnode, count);
-							/*
-							 * overwrite SubLink node to true condition if it is contained in AND_EXPR.
-							 * EXISTS clause have already overwritten to LATERAL, so original EXISTS clause
-							 * is not necessory.
-							 */
-							if (IsA(opnode, SubLink))
-								lfirst(lc) = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool), BoolGetDatum(true), false, true);
-						}
-						break;
-					case OR_EXPR:
-					case NOT_EXPR:
-						if (checkExprHasSubLink(node))
-							ereport(ERROR,
-									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									 errmsg("this query is not allowed on incrementally maintainable materialized view"),
-									 errhint("OR or NOT conditions and EXISTS condition are not used together")));
-						break;
+					foreach(lc, ((BoolExpr *) node)->args)
+					{
+						/* If simple EXISTS subquery is used, rewrite LATERAL subquery */
+						Node *opnode = (Node *) lfirst(lc);
+						query = rewrite_exists_subquery_walker(query, opnode, count);
+
+						/*
+						 * overwrite SubLink node to true condition if it is contained in AND_EXPR.
+						 * EXISTS clause have already overwritten to LATERAL, so original EXISTS clause
+						 * is not necessory.
+						 */
+						if (IsA(opnode, SubLink))
+							lfirst(lc) = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool), BoolGetDatum(true), false, true);
+					}
 				}
 				break;
 			}
@@ -1707,7 +1731,7 @@ rewrite_exists_subquery_walker(Query *query, Node *node, int *count)
 				/* assume the new RTE is at the end */
 				rtr = makeNode(RangeTblRef);
 				rtr->rtindex = list_length(query->rtable);
-				((FromExpr *)query->jointree)->fromlist = lappend(((FromExpr *)query->jointree)->fromlist, rtr);
+				((FromExpr *) query->jointree)->fromlist = lappend(((FromExpr *) query->jointree)->fromlist, rtr);
 
 				/*
 				 * EXISTS condition is converted to HAVING count(*) > 0.
@@ -1715,13 +1739,13 @@ rewrite_exists_subquery_walker(Query *query, Node *node, int *count)
 				 */
 				opId = OpernameGetOprid(list_make2(makeString("pg_catalog"), makeString(">")), INT8OID, INT4OID);
 				opexpr = make_opclause(opId, BOOLOID, false,
-								(Expr *)fn_node,
-								(Expr *)makeConst(INT4OID, -1, InvalidOid, sizeof(int32), Int32GetDatum(0), false, true),
+								(Expr *) fn_node,
+								(Expr *) makeConst(INT4OID, -1, InvalidOid, sizeof(int32), Int32GetDatum(0), false, true),
 								InvalidOid, InvalidOid);
 				fix_opfuncids((Node *) opexpr);
 				query->hasSubLinks = false;
 
-				subselect->havingQual = (Node *)opexpr;
+				subselect->havingQual = (Node *) opexpr;
 				(*count)++;
 				break;
 			}
@@ -1744,7 +1768,7 @@ rewrite_exists_subquery_walker(Query *query, Node *node, int *count)
  *     SELECT 1, COUNT(*) AS __ivm_exists_count_0__
  *     FROM t2
  *     WHERE t1.key = t2.key
- *     HAVING __ivm_exists_count_0__ > 0) AS ex
+ *     HAVING COUNT(*) > 0) AS ex
  */
 Query *
 rewrite_query_for_exists_subquery(Query *query)
@@ -1756,7 +1780,7 @@ rewrite_query_for_exists_subquery(Query *query)
 				 errmsg("this query is not allowed on incrementally maintainable materialized view"),
 				 errhint("aggregate function and EXISTS condition are not supported at the same time")));
 
-	return rewrite_exists_subquery_walker(query, (Node *)query, &count);
+	return rewrite_exists_subquery_walker(query, (Node *) query, &count);
 }
 
 /*
@@ -2039,7 +2063,8 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 		/* apply new delta */
 		if (use_count)
 			apply_new_delta_with_count(matviewname, NEW_DELTA_ENRNAME,
-								keys, aggs_set_new, &target_list_buf, count_colname);
+								keys, aggs_set_new, &target_list_buf, count_colname,
+								query->distinctClause != NULL);
 		else
 			apply_new_delta(matviewname, NEW_DELTA_ENRNAME, &target_list_buf);
 	}
@@ -2523,12 +2548,14 @@ apply_old_delta(const char *matviewname, const char *deltaname_old,
 static void
 apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
 				List *keys, StringInfo aggs_set, StringInfo target_list,
-				const char* count_colname)
+				const char* count_colname, bool distinct)
 {
 	StringInfoData	querybuf;
 	StringInfoData	returning_keys;
 	ListCell	*lc;
 	char	*match_cond = "";
+	StringInfoData	deltaname_new_for_insert;
+
 
 	/* build WHERE condition for searching tuples to be updated */
 	match_cond = get_matching_condition_string(keys);
@@ -2549,6 +2576,24 @@ apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
 	else
 		appendStringInfo(&returning_keys, "NULL");
 
+	/*
+	 * If count_colname is not "__ivm_count__", the view contains EXISTS
+	 * subquery and the count column to be updated here is "__ivm_exists_count_*"
+	 * that stores the number of columns generated by corresponding EXISTS
+	 * subquery for each row in the view. In this case, __ivm_count__ in
+	 * deltaname_new stores duplicity of rows, and each row need to be
+	 * duplicated as much as __ivm_count__ by using generate_series at
+	 * inserting if DISTINCT is not used.
+	 */
+	initStringInfo(&deltaname_new_for_insert);
+	if (!strcmp(count_colname, "__ivm_count__") || distinct)
+		appendStringInfo(&deltaname_new_for_insert, "%s", deltaname_new);
+	else
+		appendStringInfo(&deltaname_new_for_insert,
+			"(SELECT diff.* FROM %s diff,"
+				"pg_catalog.generate_series(1, diff.\"__ivm_count__\"))",
+			deltaname_new);
+
 	/* Search for matching tuples from the view and update if found or insert if not. */
 	initStringInfo(&querybuf);
 	appendStringInfo(&querybuf,
@@ -2567,9 +2612,8 @@ apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
 					match_cond,
 					returning_keys.data,
 					matviewname, target_list->data,
-					target_list->data, deltaname_new,
+					target_list->data, deltaname_new_for_insert.data,
 					match_cond);
-
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
 }

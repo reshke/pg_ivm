@@ -2,7 +2,7 @@
 
 The `pg_ivm` module provides Incremental View Maintenance (IVM) feature for PostgreSQL.
 
-The extension is compatible with PostgreSQL 13, 14, 15, and 16.
+The extension is compatible with PostgreSQL 13, 14, 15, 16, and 17.
 
 ## Description
 
@@ -54,6 +54,8 @@ postgres=# SELECT * FROM m; -- automatically updated
 (4 rows)
 ```
 
+Note that if you use PostgreSQL 17 or later, during automatic maintenance of an IMMV, the `search_path` is temporarily changed to `pg_catalog, pg_temp`.
+
 ## Installation
 To install `pg_ivm`, execute this in the module's directory:
 
@@ -80,7 +82,7 @@ When `pg_ivm` is installed, the following objects are created.
 
 ### Functions
 
-#### create_imm
+#### create_immv
 
 Use `create_immv` function to create IMMV.
 ```
@@ -90,6 +92,8 @@ create_immv(immv_name text, view_definition text) RETURNS bigint
 
 When an IMMV is created, some triggers are automatically created so that the view's contents are immediately updated when its base tables are modified. In addition, a unique index is created on the IMMV automatically if possible.  If the view definition query has a GROUP BY clause, a unique index is created on the columns of GROUP BY expressions. Also, if the view has DISTINCT clause, a unique index is created on all columns in the target list. Otherwise, if the IMMV contains all primary key attributes of its base tables in the target list, a unique index is created on these attributes.  In other cases, no index is created.
 
+Note that if you use PostgreSQL 17 or later, while `create_immv` is running, the `search_path` is temporarily changed to `pg_catalog, pg_temp`.
+
 #### refresh_imm
 
 Use `refresh_immv` function to refresh IMMV.
@@ -97,9 +101,11 @@ Use `refresh_immv` function to refresh IMMV.
 refresh_immv(immv_name text, with_data bool) RETURNS bigint
 ```
 
-`refresh_immv` completely replaces the contents of an IMMV as `REFRESH MATERIALIZED VIEW` command does for a materialized view. To execute this function you must be the owner of the IMMV.  The old contents are discarded.
+`refresh_immv` completely replaces the contents of an IMMV as `REFRESH MATERIALIZED VIEW` command does for a materialized view. To execute this function you must be the owner of the IMMV (with PostgreSQL 16 or earlier) or have the `MAINTAIN` privilege on the IMMV (with PostgreSQL 17 or later).  The old contents are discarded.
 
 The with_data flag is corresponding to `WITH [NO] DATA` option of REFRESH MATERIALIZED VIEW` command. If with_data is true, the backing query is executed to provide the new data, and if the IMMV is unpopulated, triggers for maintaining the view are created. Also, a unique index is created for IMMV if it is possible and the view doesn't have that yet. If with_data is false, no new data is generated and the IMMV become unpopulated, and the triggers are dropped from the IMMV. Note that unpopulated IMMV is still scannable although the result is empty. This behaviour may be changed in future to raise an error when an unpopulated IMMV is scanned.
+
+Note that if you use PostgreSQL 17 or later, while `refresh_immv` is running, the `search_path` is temporarily changed to `pg_catalog, pg_temp`.
 
 #### get_immv_def
 
